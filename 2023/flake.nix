@@ -2,54 +2,78 @@
   inputs = {
     opam-nix.url = "github:tweag/opam-nix";
     flake-utils.url = "github:numtide/flake-utils";
-    nixpkgs.follows = "opam-nix/nixpkgs";
+    # we pin opam-nix's nixpkgs to follow the flakes, avoiding using two different instances
+    opam-nix.inputs.nixpkgs.follows = "nixpkgs";
+
+    # maintain a different opam-repository to those pinned upstream
+    opam-repository = {
+      url = "github:ocaml/opam-repository";
+      flake = false;
+    };
+    opam-nix.inputs.opam-repository.follows = "opam-repository";
+
+    # deduplicate flakes
+    opam-nix.inputs.flake-utils.follows = "flake-utils";
   };
-  outputs = { self, flake-utils, opam-nix, nixpkgs }@inputs:
+  outputs = { self, nixpkgs, flake-utils, opam-nix, ... }@inputs:
+    # create outputs for each default system
     flake-utils.lib.eachDefaultSystem (system:
       let
+        package = "aoc";
         pkgs = nixpkgs.legacyPackages.${system};
-        on = opam-nix.lib.${system};
-        localPackagesQuery = builtins.mapAttrs (_: pkgs.lib.last)
-          (on.listRepo (on.makeOpamRepo ./.));
+        opam-nix-lib = opam-nix.lib.${system};
         devPackagesQuery = {
-          # You can add "development" packages here. They will get added to the devShell automatically.
           ocaml-lsp-server = "*";
           ocamlformat = "*";
+          # 1.9.6 fails to build
+          ocamlfind = "*";
+          utop = "*";
+          core = "*";
         };
-        query = devPackagesQuery // {
-          ## You can force versions of certain packages here, e.g:
-          ## - force the ocaml compiler to be taken from opam-repository:
+        query = {
           ocaml-base-compiler = "*";
-          ## - or force the compiler to be taken from nixpkgs and be a certain version:
-          # ocaml-system = "4.14.0";
-          ## - or force ocamlfind to be a certain version:
-          # ocamlfind = "1.9.2";
         };
-        scope = on.buildOpamProject' { } ./. query;
-        overlay = final: prev:
-          {
-            # You can add overrides here
+        resolved-scope =
+          # recursive finds vendored dependancies in duniverse
+          opam-nix-lib.buildOpamProject' { recursive = true; } ./. (query // devPackagesQuery);
+        materialized-scope =
+          opam-nix-lib.materializedDefsToScope { sourceMap.${package} = ./.; } ./package-defs.json;
+      in rec {
+        packages = rec {
+          resolved = resolved-scope;
+          materialized = materialized-scope;
+          # to generate:
+          #   cat $(nix eval .#package-defs --raw) > package-defs.json
+          package-defs = opam-nix-lib.materializeOpamProject' { } ./. (query // devPackagesQuery);
+        };
+        defaultPackage = packages.materialized.${package};
+
+        devShells =
+          let
+            mkDevShell = scope:
+              let
+                devPackages = builtins.attrValues
+                  (pkgs.lib.getAttrs (builtins.attrNames devPackagesQuery) scope);
+              in pkgs.mkShell {
+                inputsFrom = [ scope.${package} ];
+                buildInputs = devPackages;
+              };
+            dev-scope =
+              # don't pick up duniverse deps
+              # it can be slow to build vendored dependancies in a deriviation before getting an error
+              opam-nix-lib.buildOpamProject' { } ./. (query // devPackagesQuery);
+          in rec {
+            resolved = mkDevShell resolved-scope;
+            materialized = mkDevShell materialized-scope;
+            # use for fast development as it doesn't building vendored sources in seperate derivations
+            # however might not build the same result as `nix build .`,
+            # like `nix develop .#devShells.x86_64-linux.resolved -c dune build` should do
+            dev = mkDevShell dev-scope;
+            default = dev;
           };
-        scope' = scope.overrideScope' overlay;
-        # Packages from devPackagesQuery
-        devPackages = builtins.attrValues
-          (pkgs.lib.getAttrs (builtins.attrNames devPackagesQuery) scope');
-        # Packages in this workspace
-        packages =
-          pkgs.lib.getAttrs (builtins.attrNames localPackagesQuery) scope';
-      in {
-        legacyPackages = scope';
-
-        inherit packages;
-
-        ## If you want to have a "default" package which will be built with just `nix build`, do this instead of `inherit packages;`:
-        # packages = packages // { default = packages.<your default package>; };
-
-        devShells.default = pkgs.mkShell {
-          inputsFrom = builtins.attrValues packages;
-          buildInputs = devPackages ++ [
-            # You can add packages from nixpkgs here
-          ];
-        };
-      });
+      }) // {
+    nixosModules.default = {
+      imports = [ ./module.nix ];
+    };
+  };
 }
